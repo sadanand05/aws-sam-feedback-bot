@@ -1,0 +1,307 @@
+# This is the SAM template that represents the architecture of your serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+# The AWSTemplateFormatVersion identifies the capabilities of the template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/format-version-structure.html
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Feedback-LexBot
+
+# Transform section specifies one or more macros that AWS CloudFormation uses to process your template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/transform-section-structure.html
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  Workload:
+    Type: String
+    Default: "dev"
+    Description: "The type of workload (environment) that this stack will run"
+
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  # Each Lambda function is defined by properties:
+  # https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+
+  # feedback bot validation lambda function
+  feedbackBotValidation:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      FunctionName: !Sub
+        - "${AWS::StackName}-validation-${Workload}"
+        - Workload: !Ref Workload
+      Environment:
+        Variables: # pass in the name of the intent dynamically so that it can be deployment with cloudformation repeatedly
+          feedbackIntentName: !Sub
+            - '${AWS::StackName}_intent_${Workload}'
+            - Workload: !Ref Workload
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 100
+      CodeUri: ./src/validation/
+      Description: A Lambda function that validates the Lex Bot slot values.
+      Policies:
+        # Give Lambda basic execution Permission to the function
+        - AWSLambdaBasicExecutionRole
+  
+  # custom slot for numeric scale values 0-3
+  zeroToThreeSlot:
+    Type: Custom::LexSlotType
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: cfn-lex-slot-type-1-0-3-ServiceToken
+      name: !Sub
+        - '${AWS::StackName}_zero_to_three_slot_${Workload}'
+        - Workload: !Ref Workload
+      description: 0-3 scale for not at all through to three times or more
+      valueSelectionStrategy: TOP_RESOLUTION
+      enumerationValues:
+      - value: 0
+        synonyms:
+          - not at all
+          - none
+      - value: 1
+        synonyms:
+          - once
+      - value: 2
+        synonyms:
+          - twice
+          - two times
+      - value: 3
+        synonyms:
+          - three times
+          - thrice
+          - more than three times
+
+  # custom slot for numeric scale values 1-4
+  oneToFourSlot:
+    Type: Custom::LexSlotType
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: cfn-lex-slot-type-1-0-3-ServiceToken
+      name: !Sub
+        - '${AWS::StackName}_one_to_four_slot_${Workload}'
+        - Workload: !Ref Workload
+      description: 1-4 scale for how many times a call needed to be made
+      valueSelectionStrategy: TOP_RESOLUTION
+      enumerationValues:
+      - value: 1
+        synonyms:
+          - once
+      - value: 2
+        synonyms:
+          - twice
+          - two times
+      - value: 3
+        synonyms:
+          - three times
+          - thrice
+      - value: 4
+        synonyms:
+          - four times
+          - five
+          - four
+          - five times
+          - more than three times
+          - i lost count
+          - too many
+
+  # custom slot for numeric scale values 1-5 as a likert scale
+  likertScaleSlot:
+    Type: Custom::LexSlotType
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: cfn-lex-slot-type-1-0-3-ServiceToken
+      name: !Sub
+        - '${AWS::StackName}_agree_disagree_slot_${Workload}'
+        - Workload: !Ref Workload
+      description: 1-5 scale for strongly agree through to strongly disagree
+      valueSelectionStrategy: TOP_RESOLUTION
+      enumerationValues:
+      - value: 1
+        synonyms:
+          - strongly agree
+          - yeah loads
+      - value: 2
+        synonyms:
+          - agree
+      - value: 3
+        synonyms:
+          - neither
+          - don't care
+          - not bothered
+      - value: 4
+        synonyms:
+          - disagree
+      - value: 5
+        synonyms:
+          - strongly disagree
+
+  # give permission to Lex bots to run the validation function
+  conciergeBotPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt feedbackBotValidation.Arn
+      Principal: lex.amazonaws.com
+
+  # the feedback intent itself
+  # needs the slot types, lambda function and 
+  # permission to run the lambda function
+  conciergeBotIntent:
+      Type: Custom::LexIntent
+      DependsOn:
+      - likertScaleSlot
+      - zeroToThreeSlot
+      - oneToFourSlot
+      - feedbackBotValidation
+      - conciergeBotPermission
+      Properties:
+        ServiceToken:
+          Fn::ImportValue: cfn-lex-intent-1-0-3-ServiceToken
+        name: !Sub
+        - '${AWS::StackName}_intent_${Workload}'
+        - Workload: !Ref Workload
+        confirmationPrompt:
+          maxAttempts: 1
+          messages:
+            - content: "Is that your feedback complete?"
+              contentType: "PlainText"
+        fulfillmentActivity:
+          type: "ReturnIntent" # this will need to change for the fulfillment function
+        dialogCodeHook:
+          uri: !GetAtt feedbackBotValidation.Arn # point to the validation function
+          messageVersion: 1.0
+        rejectionStatement:
+          messages:
+            - content: "Ok, we'll leave it there, thanks so much!"
+              contentType: "PlainText"
+            - content: "I've cancelled your feedback."
+              contentType: "PlainText"
+        sampleUtterances:
+          - "{easyToUse}"
+        slots:
+        - name: easyToUse
+          description: Was the service easy to use?
+          priority: 1
+          slotConstraint: Required
+          slotType: 
+            Ref: likertScaleSlot
+          slotTypeVersion: "$LATEST"
+          valueElicitationPrompt:
+            maxAttempts: 2
+            messages:
+            - content: First question, was it easy to use the automated service? Answer with Strongly agree, agree, don't know, disagree or strongly disagree
+              contentType: PlainText
+        - name: repeatMyself
+          description: Did you have to repeat yourself?
+          priority: 2
+          slotConstraint: Required
+          slotType: 
+            Ref: zeroToThreeSlot
+          slotTypeVersion: "$LATEST"
+          valueElicitationPrompt:
+            maxAttempts: 2
+            messages:
+            - content: Thanks. How many times did you have to repeat yourself? Not at all, once, twice or three times?
+              contentType: PlainText
+        - name: repeatedWord
+          description: Which word did you need to repeat?
+          priority: 3
+          slotConstraint: Optional
+          slotType: AMAZON.Service # don't need a version for built-in slot types
+          valueElicitationPrompt:
+            maxAttempts: 2
+            messages:
+            - content: What word or phrase did you have to repeat?
+              contentType: PlainText
+        - name: howManyTimes
+          description: How many times did the caller call to get through?
+          priority: 4
+          slotConstraint: Required
+          slotType: 
+            Ref: oneToFourSlot
+          slotTypeVersion: "$LATEST"
+          valueElicitationPrompt:
+            maxAttempts: 2
+            messages:
+            - content: Thank you. How many times did you need to call, before getting through?
+              contentType: PlainText
+        - name: satisfied
+          description: Were you satisfied with your experience?
+          priority: 5
+          slotConstraint: Required
+          slotType: 
+            Ref: likertScaleSlot
+          slotTypeVersion: "$LATEST"
+          valueElicitationPrompt:
+            maxAttempts: 2
+            messages:
+            - content: And the final statement is "Overall, I was satisfied with my experience"?
+              contentType: PlainText
+        
+
+  # Lex bot itself
+  # only depends on the intent because 
+  # the intent depends on everything else
+  conciergeBot:
+    Type: Custom::LexBot
+    DependsOn:
+      - conciergeBotIntent
+    Properties: 
+      ServiceToken:
+        Fn::ImportValue: cfn-lex-bot-1-0-4-ServiceToken
+      name: !Sub
+        - '${AWS::StackName}_bot_${Workload}'
+        - Workload: !Ref Workload
+      abortStatement:
+        messages:
+          - content: "I don't understand. Can you try again?"
+            contentType: "PlainText"
+          - content: "I'm sorry, I don't understand."
+            contentType: "PlainText"
+      childDirected: false
+      clarificationPrompt:
+        maxAttempts: 1
+        messages:
+          - content: "I'm sorry, I didn't hear that. Can you repeate what you just said?"
+            contentType: "PlainText"
+          - content: "Can you say that again please?"
+            contentType: "PlainText"
+      description: 'a bot'
+      voiceId: Joanna # have to use a en-US voice because of locale error
+      idleSessionTTLInSeconds: 300
+      intents:
+        - intentName:
+            Ref: conciergeBotIntent
+          intentVersion: "$LATEST" # always use the latest intent
+      locale: en-US # for some reason it won't build as en-GB which is odd, throws a 400 error
+      processBehavior: "BUILD" # build automatically, although this doesn't trigger if the bot itself isn't changed
+
+# Outputs:
+#   ConciergeBotChecksum:
+#     Description: The checksum of the Lex Bot for this stack.
+#     Value: !GetAtt conciergeBot.checksum
+#     Export:
+#       Name: fn-bot-checksum
+#   ConciergeBotVersion:
+#     Description: The version of the Lex Bot for this stack.
+#     Value: !GetAtt conciergeBot.version
+#   ConciergeBotFeedbackIntentChecksum:
+#     Description: The checksum of the custom intent for this stack.
+#     Value: !GetAtt conciergeBotIntent.checksum
+#     Export:
+#       Name: fn-bot-intent-checksum
+#   ConciergeBotFeedbackIntentVersion:
+#     Description: The version of the custom intent for this stack.
+#     Value: !GetAtt conciergeBotIntent.version
+#   ConciergeBotLikertScaleSlotChecksum:
+#     Description: The checksum of the custom intent for this stack.
+#     Value: !GetAtt likertScaleSlot.checksum
+#     Export:
+#       Name: fn-bot-slot-checksum
+#   ConciergeBotLikertScaleSlotVersion:
+#     Description: The version of the custom intent for this stack.
+#     Value: !GetAtt likertScaleSlot.version
